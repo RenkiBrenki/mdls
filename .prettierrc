@@ -1,1 +1,1 @@
-{ "tabWidth": 8, "objectWrap": "collapse" }
+{ "tabWidth": 4, "objectWrap": "collapse", "printWidth": 120 }
