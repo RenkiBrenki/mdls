@@ -20,19 +20,27 @@ const documents = new TextDocuments(TextDocument);
 
 type FareModelDef = { fareModel: FareModel; uri: string; range: Range };
 type FareModel = { code: string; version: string };
+type FareModelRef = { key: string; uri: string; range: Range };
 
 const defsByName = new Map<string, FareModelDef[]>();
 const defsByUri = new Map<string, FareModelDef[]>();
+const refsByName = new Map<string, FareModelRef[]>();
+const refsByUri = new Map<string, FareModelRef[]>();
 
 let hasDiagnosticRelatedInformationCapability = false;
 
 connection.onInitialize((params: InitializeParams) => {
     const capabilities = params.capabilities;
 
-    hasDiagnosticRelatedInformationCapability = !!capabilities.textDocument?.publishDiagnostics?.relatedInformation;
+    hasDiagnosticRelatedInformationCapability =
+        !!capabilities.textDocument?.publishDiagnostics?.relatedInformation;
 
     const result: InitializeResult = {
-        capabilities: { textDocumentSync: TextDocumentSyncKind.Incremental, definitionProvider: true },
+        capabilities: {
+            textDocumentSync: TextDocumentSyncKind.Incremental,
+            definitionProvider: true,
+            referencesProvider: true,
+        },
     };
     return result;
 });
@@ -60,6 +68,15 @@ function forgetDoc(uri: string) {
         else defsByName.delete(def.fareModel.code);
     }
     defsByUri.delete(uri);
+
+    for (const ref of refsByUri.get(uri) ?? []) {
+        const arr = refsByName.get(ref.key);
+        if (!arr) continue;
+        const kept = arr.filter((r) => r.uri !== uri);
+        if (kept.length) refsByName.set(ref.key, kept);
+        else refsByName.delete(ref.key);
+    }
+    refsByUri.delete(uri);
 }
 
 function index(textDocument: TextDocument) {
@@ -69,29 +86,56 @@ function index(textDocument: TextDocument) {
     if (!root) return;
 
     walk(root, (node) => {
-        if (node.type !== "object") return;
-        const codeNode = propValueNode(node, "code");
+        if (node.type === "object") {
+            const codeNode = propValueNode(node, "code");
 
-        if (!codeNode || typeof codeNode.value !== "string") return;
-        const fareModel: FareModel | null = parseCode(codeNode.value);
+            if (!codeNode || typeof codeNode.value !== "string") return;
+            const fareModel: FareModel | null = parseCode(codeNode.value);
 
-        if (fareModel === null) return;
+            if (fareModel === null) return;
 
-        const def: FareModelDef = {
-            fareModel: fareModel,
-            uri: textDocument.uri,
-            range: rangeOf(textDocument, codeNode),
-        };
+            const def: FareModelDef = {
+                fareModel: fareModel,
+                uri: textDocument.uri,
+                range: {
+                    start: textDocument.positionAt(codeNode.offset),
+                    end: textDocument.positionAt(
+                        codeNode.offset + codeNode.length,
+                    ),
+                },
+            };
 
-        push(defsByName, fareModel.code, def);
-        push(defsByUri, textDocument.uri, def);
+            push(defsByName, fareModel.code, def);
+            push(defsByUri, textDocument.uri, def);
+            return;
+        }
+
+        if (
+            node.type === "string" &&
+            typeof node.value === "string" &&
+            node.value.includes("@") &&
+            !node.value.includes("?") &&
+            !isCodeValue(node)
+        ) {
+            const ref: FareModelRef = {
+                key: codeKey(node.value),
+                uri: textDocument.uri,
+                range: {
+                    start: textDocument.positionAt(node.offset),
+                    end: textDocument.positionAt(node.offset + node.length),
+                },
+            };
+
+            push(refsByName, ref.key, ref);
+            push(refsByUri, textDocument.uri, ref);
+        }
     });
 }
 
-const rangeOf = (doc: TextDocument, n: Node): Range => ({
-    start: doc.positionAt(n.offset),
-    end: doc.positionAt(n.offset + n.length),
-});
+function isCodeValue(node: Node): boolean {
+    const p = node.parent;
+    return p?.type === "property" && p.children?.[0]?.value === "code";
+}
 
 function parseCode(code: string): FareModel | null {
     const at = code?.indexOf("@");
@@ -99,11 +143,16 @@ function parseCode(code: string): FareModel | null {
 
     if (at < 1 || questionMark < 0) return null;
 
-    return { code: code.slice(0, questionMark), version: code.slice(questionMark + 1) };
+    return {
+        code: code.slice(0, questionMark),
+        version: code.slice(questionMark + 1),
+    };
 }
 
 function propValueNode(obj: Node, key: string): Node | undefined {
-    const p = obj.children?.find((c) => c.type === "property" && c.children?.[0]?.value === key);
+    const p = obj.children?.find(
+        (c) => c.type === "property" && c.children?.[0]?.value === key,
+    );
     return p?.children?.[1];
 }
 
@@ -122,12 +171,14 @@ connection.onDidChangeWatchedFiles((_change) => {
     connection.console.log("We received a file change event");
 });
 
-connection.onCompletion((_textDocumentPosition: TextDocumentPositionParams): CompletionItem[] => {
-    return [
-        { label: "TypeScript", kind: CompletionItemKind.Text, data: 1 },
-        { label: "JavaScript", kind: CompletionItemKind.Text, data: 2 },
-    ];
-});
+connection.onCompletion(
+    (_textDocumentPosition: TextDocumentPositionParams): CompletionItem[] => {
+        return [
+            { label: "TypeScript", kind: CompletionItemKind.Text, data: 1 },
+            { label: "JavaScript", kind: CompletionItemKind.Text, data: 2 },
+        ];
+    },
+);
 
 connection.onCompletionResolve((item: CompletionItem): CompletionItem => {
     if (item.data === 1) {
@@ -166,8 +217,25 @@ connection.onDefinition(({ textDocument, position }) => {
 
     const defs = (defsByName.get(key) ?? [])
         .slice()
-        .sort((a, b) => a.fareModel.version.localeCompare(b.fareModel.version, undefined, { numeric: true }));
+        .sort((a, b) =>
+            a.fareModel.version.localeCompare(b.fareModel.version, undefined, {
+                numeric: true,
+            }),
+        );
     return defs.map<Location>((d) => ({ uri: d.uri, range: d.range }));
+});
+
+connection.onReferences(({ textDocument, position }) => {
+    const doc = documents.get(textDocument.uri);
+    if (!doc) return null;
+
+    const key = refAtCursor(doc, doc.offsetAt(position));
+    if (!key) return null;
+
+    return (refsByName.get(key) ?? []).map((r) => ({
+        uri: r.uri,
+        range: r.range,
+    }));
 });
 
 documents.listen(connection);
