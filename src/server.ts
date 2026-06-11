@@ -10,6 +10,7 @@ import {
     type InitializeResult,
     type Range,
     type Location,
+    type WorkDoneProgressReporter,
 } from "vscode-languageserver/node";
 
 import { TextDocument } from "vscode-languageserver-textdocument";
@@ -55,8 +56,28 @@ documents.onDidClose((e) => {
     forgetDoc(e.document.uri);
 });
 
-documents.onDidChangeContent((change) => {
-    index(change.document);
+const PROGRESS_THRESHOLD = 100_000;
+
+documents.onDidChangeContent(async (change) => {
+    const doc = change.document;
+    if (doc.getText().length < PROGRESS_THRESHOLD) {
+        index(doc);
+        return;
+    }
+
+    const version = doc.version;
+    const progress = await connection.window.createWorkDoneProgress();
+    if (documents.get(doc.uri)?.version !== version) {
+        progress.done();
+        return;
+    }
+
+    progress.begin("Indexing", 0, doc.uri);
+    try {
+        index(doc, progress);
+    } finally {
+        progress.done();
+    }
 });
 
 function forgetDoc(uri: string) {
@@ -79,13 +100,26 @@ function forgetDoc(uri: string) {
     refsByUri.delete(uri);
 }
 
-function index(textDocument: TextDocument) {
+function index(
+    textDocument: TextDocument,
+    progress?: WorkDoneProgressReporter,
+) {
     forgetDoc(textDocument.uri);
 
-    const root = parseTree(textDocument.getText());
+    const text = textDocument.getText();
+    const root = parseTree(text);
     if (!root) return;
 
+    let lastPct = 0;
     walk(root, (node) => {
+        if (progress) {
+            const pct = (node.offset / text.length) * 100;
+            if (pct - lastPct >= 10) {
+                lastPct = pct;
+                progress.report(pct);
+            }
+        }
+
         if (node.type === "object") {
             const codeNode = propValueNode(node, "code");
 
@@ -117,12 +151,13 @@ function index(textDocument: TextDocument) {
             !node.value.includes("?") &&
             !isCodeValue(node)
         ) {
+            const target = enclosingCodeNode(node) ?? node;
             const ref: FareModelRef = {
                 key: codeKey(node.value),
                 uri: textDocument.uri,
                 range: {
-                    start: textDocument.positionAt(node.offset),
-                    end: textDocument.positionAt(node.offset + node.length),
+                    start: textDocument.positionAt(target.offset),
+                    end: textDocument.positionAt(target.offset + target.length),
                 },
             };
 
@@ -130,6 +165,21 @@ function index(textDocument: TextDocument) {
             push(refsByUri, textDocument.uri, ref);
         }
     });
+}
+
+function enclosingCodeNode(node: Node): Node | undefined {
+    for (let cur = node.parent; cur; cur = cur.parent) {
+        if (cur.type !== "object") continue;
+        const codeNode = propValueNode(cur, "code");
+        if (
+            codeNode &&
+            typeof codeNode.value === "string" &&
+            parseCode(codeNode.value)
+        ) {
+            return codeNode;
+        }
+    }
+    return undefined;
 }
 
 function isCodeValue(node: Node): boolean {
